@@ -1,0 +1,276 @@
+# Full stack overlay: reSpotIt + OpenWebUI + Keycloak + MCP services
+# Usage: docker compose -f docker-compose.yml -f docker-compose.full.yml up -d --build
+#
+# Requires (not in this repo - see docs/DEPLOYMENT.md):
+#   certs/                    # mkcert CA + server certs
+#   OpenWebUI-stack/          # nginx, keycloak realm, MCP sources
+#   .env                      # all secrets (see .env.example)
+#
+# docs/DEPLOYMENT.md explains how to obtain the certs/ and OpenWebUI-stack/
+# folders and how to generate .env from .env.example.
+
+services:
+  # host.docker.internal is automatic on Docker Desktop but not on Linux.
+  # The API and Open WebUI use it for the optional host llama-server.
+  api:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # OpenWebUI / Keycloak stack (from backup workspace)
+  # ────────────────────────────────────────────────────────────────────────────
+  minio:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    volumes:
+      - ./docker-data/minio:/data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+
+  create-bucket:
+    image: pgsty/mc:RELEASE.2026-10-26T00-00-00Z
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set myminio http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin}); do echo 'Waiting for MinIO...'; sleep 5; done;
+      /usr/bin/mc mb myminio/${MINIO_BUCKET_NAME:-openwebui} --ignore-existing;
+      /usr/bin/mc policy set public myminio/${MINIO_BUCKET_NAME:-openwebui};
+      echo 'Bucket created successfully';
+      "
+    restart: "no"
+
+  openwebui-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${OPENWEBUI_DB_NAME:-openwebui}
+      POSTGRES_USER: ${OPENWEBUI_DB_USER:-openwebui}
+      POSTGRES_PASSWORD: ${OPENWEBUI_DB_PASSWORD:-openwebui}
+    volumes:
+      - ./docker-data/openwebui-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${OPENWEBUI_DB_USER:-openwebui}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  keycloak-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: ${KEYCLOAK_DB_USER:-keycloak}
+      POSTGRES_PASSWORD: ${KEYCLOAK_DB_PASSWORD:-keycloak}
+    volumes:
+      - ./docker-data/keycloak-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${KEYCLOAK_DB_USER:-keycloak}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.2
+    command: start --hostname-strict=false --http-relative-path=/authKeycloak/ --proxy-headers=xforwarded --http-enabled=true --hostname-backchannel-dynamic=false --import-realm
+    volumes:
+      - ./OpenWebUI-stack/keycloak:/opt/keycloak/data/import
+    depends_on:
+      keycloak-db:
+        condition: service_healthy
+    environment:
+      KC_PROXY_HEADERS: xforwarded
+      KC_HTTP_ENABLED: "true"
+      KC_HTTP_RELATIVE_PATH: /authKeycloak
+      KC_HOSTNAME: ${KEYCLOAK_HOSTNAME:-https://localhost/authKeycloak}
+      KEYCLOAK_ADMIN: ${KEYCLOAK_ADMIN:-admin}
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
+      KC_DB_USERNAME: ${KEYCLOAK_DB_USER:-keycloak}
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:-keycloak}
+      KC_HTTP_RESPONSE_HEADER__X_FRAME_OPTIONS: SAMEORIGIN
+      KC_HTTP_PORT: 8080
+    restart: unless-stopped
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:v0.13.0
+    depends_on:
+      - keycloak
+      - openwebui-db
+      - minio
+      - redis
+    ports:
+      - "13000:8080"
+    environment:
+      WEBUI_URL: ${PUBLIC_ORIGIN:-https://localhost}
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
+      WEBUI_AUTH: ${WEBUI_AUTH:-true}
+      ENABLE_API_KEYS: "true"
+      USER_PERMISSIONS_FEATURES_API_KEYS: "true"
+      BYPASS_MODEL_ACCESS_CONTROL: "true"
+      OPENAI_API_BASE_URLS: ${OPENAI_API_BASE_URL:-}
+      OPENAI_API_KEYS: ${OPENAI_API_KEY:-}
+      SSL_CERT_FILE: /etc/ssl/ca-bundle.crt
+      REQUESTS_CA_BUNDLE: /etc/ssl/ca-bundle.crt
+      AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL: "False"
+      # File storage via MinIO (S3-compatible) — restores the original wiring.
+      STORAGE_PROVIDER: s3
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_BUCKET_NAME: ${MINIO_BUCKET_NAME:-openwebui}
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_REGION_NAME: ${MINIO_REGION:-us-east-1}
+      S3_ADDRESSING_STYLE: path
+      # Websocket sessions backed by Redis (valkey).
+      ENABLE_WEBSOCKET_SUPPORT: "true"
+      WEBSOCKET_MANAGER: redis
+      WEBSOCKET_REDIS_URL: redis://redis:6379/1
+      REDIS_KEY_PREFIX: open-webui
+      ENABLE_OAUTH_SIGNUP: true
+      OAUTH_PROVIDER_NAME: ${OAUTH_PROVIDER_NAME:-Keycloak}
+      OPENID_PROVIDER_URL: ${OPENID_PROVIDER_URL:-https://localhost/authKeycloak/realms/open-webui/.well-known/openid-configuration}
+      OPENID_REDIRECT_URI: ${OPENID_REDIRECT_URI:-https://localhost/oauth/oidc/callback}
+      OAUTH_SCOPES: "openid email profile"
+      OAUTH_AUTO_SIGNUP: ${OAUTH_AUTO_SIGNUP:-true}
+      DEFAULT_USER_ROLE: ${DEFAULT_USER_ROLE:-user}
+      OAUTH_CLIENT_ID: ${OAUTH_CLIENT_ID:-open-webui}
+      OAUTH_CLIENT_SECRET: ${OAUTH_CLIENT_SECRET:-open-webui-secret}
+      OAUTH_MERGE_ACCOUNTS_BY_EMAIL: ${OAUTH_MERGE_ACCOUNTS_BY_EMAIL:-true}
+      # No trusted-header auth on the public instance: browsers cannot supply
+      # the header, and enabling it makes the normal sign-in fail with
+      # "Your provider has not provided a trusted header". The API's
+      # trusted-header exchange targets open-webui-2 instead.
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${OPENWEBUI_DB_USER:-openwebui}:${OPENWEBUI_DB_PASSWORD:-openwebui}@openwebui-db:5432/${OPENWEBUI_DB_NAME:-openwebui}}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./docker-data/open-webui:/app/backend/data
+      - ./OpenWebUI-stack/ssl/ca-bundle.crt:/etc/ssl/ca-bundle.crt:ro
+      - ./OpenWebUI-stack/openwebui-entrypoint.sh:/app/entrypoint.sh:ro
+    entrypoint: ["/bin/bash", "/app/entrypoint.sh"]
+    restart: unless-stopped
+
+  open-webui-2:
+    image: ghcr.io/open-webui/open-webui:v0.13.0
+    depends_on:
+      - openwebui-db
+      - minio
+      - redis
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      WEBUI_URL: ${PUBLIC_ORIGIN:-https://localhost}
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY}
+      WEBUI_AUTH: ${WEBUI_AUTH:-true}
+      WEBUI_AUTH_TRUSTED_EMAIL_HEADER: X-OWUI-Trusted-Email
+      WEBUI_AUTH_TRUSTED_NAME_HEADER: X-OWUI-Trusted-Name
+      # File storage via MinIO (S3-compatible) — restores the original wiring.
+      STORAGE_PROVIDER: s3
+      S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minioadmin}
+      S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_BUCKET_NAME: ${MINIO_BUCKET_NAME:-openwebui}
+      S3_ENDPOINT_URL: http://minio:9000
+      S3_REGION_NAME: ${MINIO_REGION:-us-east-1}
+      S3_ADDRESSING_STYLE: path
+      # Websocket sessions backed by Redis (valkey).
+      ENABLE_WEBSOCKET_SUPPORT: "true"
+      WEBSOCKET_MANAGER: redis
+      WEBSOCKET_REDIS_URL: redis://redis:6379/1
+      REDIS_KEY_PREFIX: open-webui
+      ENABLE_API_KEYS: "true"
+      USER_PERMISSIONS_FEATURES_API_KEYS: "true"
+      BYPASS_MODEL_ACCESS_CONTROL: "true"
+      OPENAI_API_BASE_URLS: ${OPENAI_API_BASE_URL:-}
+      OPENAI_API_KEYS: ${OPENAI_API_KEY:-}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://${OPENWEBUI_DB_USER:-openwebui}:${OPENWEBUI_DB_PASSWORD:-openwebui}@openwebui-db:5432/${OPENWEBUI_DB_NAME:-openwebui}}
+    volumes:
+      - ./docker-data/open-webui:/app/backend/data
+    restart: unless-stopped
+
+  nginx-proxy:
+    image: nginx:1.31.8-alpine
+    restart: unless-stopped
+    ports:
+      - "10080:80"
+      - "10443:443"
+      - "127.0.0.1:8092:8082"
+    volumes:
+      - ./OpenWebUI-stack/nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./OpenWebUI-stack/nginx/index.html:/var/www/open-webui-test/index.html
+      - ./OpenWebUI-stack/ssl:/etc/nginx/ssl
+    depends_on:
+      - open-webui
+      - keycloak
+
+  redis:
+    image: valkey/valkey:8.0.1-alpine
+    restart: unless-stopped
+    volumes:
+      - ./docker-data/redis:/data
+
+  redis-insight:
+    image: redislabs/redisinsight:3.8.0
+    restart: unless-stopped
+    ports:
+      - "15540:5540"
+    depends_on:
+      - redis
+
+  pipelines:
+    image: ghcr.io/open-webui/pipelines@sha256:b48e9bc338ce2be0acfbeff01810db72408a12f07739f9e3879c1f2b00952d6e
+    restart: unless-stopped
+    volumes:
+      - ./docker-data/pipelines:/app/pipelines
+    environment:
+      PIPELINES_API_KEY: ${PIPELINES_API_KEY:-}
+
+  respotit-mcp:
+    build:
+      context: ./OpenWebUI-stack/respotit-mcp
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8091:8000"
+    environment:
+      MCP_HTTP_TOKEN: ${RESPOTIT_MCP_TOKEN:-}
+      RESPOTIT_MCP_API_URL: https://api:8000
+      RESPOTIT_MCP_API_VERIFY_TLS: "false"
+      RESPOTIT_MCP_EMAIL: ${RESPOTIT_MCP_EMAIL:-}
+      RESPOTIT_MCP_PASSWORD: ${RESPOTIT_MCP_PASSWORD:-}
+    depends_on:
+      api:
+        condition: service_healthy
+
+  spotify-mcp:
+    image: node:22-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8090:8000"
+    volumes:
+      - ./OpenWebUI-stack/spotify-mcp-data:/app/data
+    working_dir: /app
+    command: ["npx", "-y", "@novalux12/spotify-mcp@3.1.1"]
+    environment:
+      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
+      SPOTIFY_MCP_TRANSPORT: http
+      SPOTIFY_MCP_HTTP_TOKEN: ${MCP_API_KEY:-change-me-mcp-token}
+      SPOTIFY_MCP_HTTP_BIND: 0.0.0.0
+      SPOTIFY_MCP_HTTP_ALLOW_NON_LOOPBACK: "1"
+      SPOTIFY_MCP_HTTP_PORT: "8000"
+      SPOTIFY_MCP_HTTP_PATH: /mcp
+      SPOTIFY_MCP_HTTP_MAX_SESSIONS: "16"
+      SPOTIFY_MCP_TOKEN_FILE: /app/data/tokens.json
+      SPOTIFY_MCP_DATA_DIR: /app/data
+
+# No named volumes: every volume is bind-mounted under ./docker-data/ so all
+# state lives inside the project folder.
+volumes: {}
+
+networks:
+  default:
+    name: respotit
