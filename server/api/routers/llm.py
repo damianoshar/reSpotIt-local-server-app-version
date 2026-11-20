@@ -31,7 +31,8 @@ and answer with the ``chat_id`` next to the extracted rows, so the scan shows
 up in the user's chat history instead of vanishing.
 """
 import logging
-from typing import Literal
+import uuid
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
@@ -65,6 +66,9 @@ class LLMChatBody(BaseModel):
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: int = Field(default=1024, ge=1, le=4096)
     use_tools: bool = Field(default=True)
+    # Tool routing: "auto" advertises a small searchable surface (default),
+    # "all" sends every MCP schema (large prompt), "off" sends none.
+    tool_router: Literal["auto", "all", "off"] | None = Field(default=None)
     # Phase 5/6: continue a stored chat instead of starting from scratch.
     chat_id: str | None = Field(default=None, max_length=MAX_CHAT_ID_CHARS)
     use_history: bool = Field(default=True)
@@ -332,15 +336,44 @@ async def chat(
     if body.system:
         messages.append({"role": "system", "content": body.system})
 
+    chat_id = body.chat_id
+    parent_id: str | None = None
+    stored_chain: list[dict[str, Any]] = []
+
+    # A request that names a saved chat is a turn of that chat: Open WebUI
+    # writes the turn itself and needs both message ids up front. The same ids
+    # are used to finish the turn, and the user message id is what native
+    # context compaction anchors its checkpoint on.
+    managed_turn = bool(body.persist and chat_id)
+    user_message_id = str(uuid.uuid4()) if managed_turn else None
+    assistant_message_id = str(uuid.uuid4()) if managed_turn else None
+
     # Phase 6: load the stored conversation before the new turn.
-    if body.chat_id and body.use_history and body.history_limit > 0:
+    if chat_id:
         try:
-            row = await _with_chat_token(user, openwebui_service.get_chat, body.chat_id)
+            row = await _with_chat_token(user, openwebui_service.get_chat, chat_id)
         except openwebui_service.OpenWebUIError as exc:
             raise _chat_error(exc) from exc
-        messages.extend(openwebui_service.history_messages(row, body.history_limit))
+        # The chain Open WebUI replays for this chat, with its compaction
+        # checkpoint applied. The API sends the same view, so a tool-loop
+        # follow-up (which cannot use the saved-chat replay) keeps the context
+        # the first request had.
+        stored_chain = openwebui_service.compacted_chain(row)
+        if body.use_history and body.history_limit > 0:
+            messages.extend(
+                stored_chain if managed_turn else stored_chain[-body.history_limit:]
+            )
+        parent_id = openwebui_service.current_message_id(row)
 
     messages.extend(message.model_dump() for message in body.messages)
+
+    user_text = ""
+    if body.persist:
+        # A saved chat stores one user message per turn (that is what Open WebUI
+        # replays), so the turn's user messages are stored as one.
+        user_text = "\n\n".join(
+            m.content.strip() for m in body.messages if m.role == "user" and m.content.strip()
+        )
 
     try:
         result = await _with_user_token(
@@ -351,18 +384,21 @@ async def chat(
             temperature=body.temperature,
             max_tokens=body.max_tokens,
             use_tools=body.use_tools,
+            tool_router=body.tool_router,
+            chat_id=chat_id if managed_turn else None,
+            user_message_id=user_message_id,
+            assistant_message_id=assistant_message_id,
+            parent_id=parent_id,
+            user_text=user_text or None,
+            estimate_messages=stored_chain or None,
         )
     except llm_service.LLMError as exc:
         raise _contract_error(exc) from exc
 
-    chat_id = body.chat_id
     persisted = False
     if body.persist:
-        user_text = next(
-            (m.content for m in reversed(body.messages) if m.role == "user"), ""
-        ).strip()
         try:
-            if not chat_id:
+            if not managed_turn:
                 row = await _with_chat_token(
                     user,
                     openwebui_service.create_chat,
@@ -371,20 +407,41 @@ async def chat(
                     chat_type=body.chat_type,
                 )
                 chat_id = row["id"]
-            await _with_chat_token(
-                user,
-                openwebui_service.append_exchange,
-                chat_id,
-                user_text,
-                str(result.get("content") or ""),
-                model=result.get("model"),
-                title=user_text[:80] or None,
-            )
+                await _with_chat_token(
+                    user,
+                    openwebui_service.append_exchange,
+                    chat_id,
+                    user_text,
+                    str(result.get("content") or ""),
+                    model=result.get("model"),
+                    title=user_text[:80] or None,
+                    tool_calls=result.get("tool_calls") or None,
+                )
+            else:
+                await _with_chat_token(
+                    user,
+                    openwebui_service.complete_turn,
+                    chat_id,
+                    str(user_message_id),
+                    str(assistant_message_id),
+                    user_text,
+                    str(result.get("content") or ""),
+                    model=result.get("model"),
+                    parent_id=parent_id,
+                    tool_calls=result.get("tool_calls") or None,
+                )
             persisted = True
             chat_session_service.set_current_chat_id(db, str(user.id), chat_id)
         except openwebui_service.OpenWebUIError as exc:
             # The answer is still useful; report that it was not stored.
             logger.warning("Could not persist chat turn: %s", exc)
+
+    # The full tool answers exist only for the stored chain: they are already
+    # in the chat's output items above. The response keeps the short ``result``
+    # so a turn does not return tens of kilobytes to the phone.
+    for entry in result.get("tool_calls") or []:
+        if isinstance(entry, dict):
+            entry.pop("result_full", None)
 
     payload = dict(result)
     payload["chat_id"] = chat_id

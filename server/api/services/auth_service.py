@@ -5,10 +5,13 @@ Single responsibility: Spotify OAuth token lifecycle.
 Dialect-agnostic: works on both Postgres and SQLite.
 """
 
+import base64
+import hashlib
 import json
 import os
 import secrets
 import urllib.parse
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -48,9 +51,75 @@ SCOPE = (
 )
 
 
+def _pkce_verifier() -> str:
+    """A PKCE code verifier (RFC 7636 wants 43-128 unreserved characters)."""
+    return secrets.token_urlsafe(64)
+
+
+def _pkce_challenge(verifier: str) -> str:
+    """The S256 code challenge for a verifier."""
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+@dataclass(frozen=True)
+class OAuthGrant:
+    """What one authorization request carries to the callback."""
+
+    user_id: str
+    code_verifier: str | None = None
+
+
+def _store_oauth_state(user_id: str) -> tuple[str, str]:
+    """Store a state and its PKCE verifier; return both."""
+    _ensure_schema()
+    owner = str(as_uuid(user_id))
+    state = secrets.token_urlsafe(24)
+    verifier = _pkce_verifier()
+    with SessionLocal() as db:
+        db.add(OAuthState(state=state, user_id=owner, code_verifier=verifier))
+        # purge old states
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+        db.query(OAuthState).filter(OAuthState.created_at < cutoff).delete()
+        db.commit()
+    return state, verifier
+
+
+def create_oauth_state(user_id: str) -> str:
+    """The CSRF state for one authorization request."""
+    state, _verifier = _store_oauth_state(user_id)
+    return state
+
+
+def _stored_verifier(state: str) -> str | None:
+    """The PKCE verifier stored with a state, if it is still valid."""
+    if not state:
+        return None
+    _ensure_schema()
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
+    with SessionLocal() as db:
+        row = db.query(OAuthState).filter(
+            OAuthState.state == state,
+            OAuthState.created_at > cutoff,
+        ).first()
+        if not row or not row.code_verifier:
+            return None
+        return str(row.code_verifier)
+
+
 def build_auth_url(user_id: str, state: str | None = None) -> str:
+    """The URL the browser is sent to.
+
+    A deployment with a client secret is a confidential client: it proves the
+    exchange with the secret and the authorize URL stays plain. A deployment
+    without one is a public client and proves the exchange with PKCE, the same
+    way the phone does. Spotify rejects an empty client_secret with
+    "invalid_client", so the secret is only ever sent when it is set.
+    """
     if state is None:
-        state = create_oauth_state(user_id)
+        state, verifier = _store_oauth_state(user_id)
+    else:
+        verifier = _stored_verifier(state) or ""
     params = {
         "client_id":     CLIENT_ID,
         "response_type": "code",
@@ -58,6 +127,9 @@ def build_auth_url(user_id: str, state: str | None = None) -> str:
         "scope":         SCOPE,
         "state":         state,
     }
+    if not CLIENT_SECRET and verifier:
+        params["code_challenge"] = _pkce_challenge(verifier)
+        params["code_challenge_method"] = "S256"
     return "https://accounts.spotify.com/authorize?" + urllib.parse.urlencode(params)
 
 
@@ -77,20 +149,12 @@ def _ensure_schema():
         conn.close()
 
 
-def create_oauth_state(user_id: str) -> str:
-    _ensure_schema()
-    owner = str(as_uuid(user_id))
-    state = secrets.token_urlsafe(24)
-    with SessionLocal() as db:
-        db.add(OAuthState(state=state, user_id=owner))
-        # purge old states
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=15)
-        db.query(OAuthState).filter(OAuthState.created_at < cutoff).delete()
-        db.commit()
-    return state
+def validate_oauth_state(state: str | None) -> OAuthGrant | None:
+    """Consume a state and return what the callback needs.
 
-
-def validate_oauth_state(state: str | None) -> str | None:
+    The row is deleted, so a state can be used once. The PKCE verifier comes
+    back with it: the callback needs it to exchange the code.
+    """
     if not state:
         return None
     _ensure_schema()
@@ -103,21 +167,36 @@ def validate_oauth_state(state: str | None) -> str | None:
         if not row:
             return None
         user_id = row.user_id
+        verifier = row.code_verifier
         db.delete(row)
         db.commit()
-    return str(user_id)
+    return OAuthGrant(
+        user_id=str(user_id),
+        code_verifier=str(verifier) if verifier else None,
+    )
 
 
-def exchange_code(code: str) -> dict:
+def exchange_code(code: str, code_verifier: str | None = None) -> dict:
+    """Trade the authorization code for tokens.
+
+    A deployment with a client secret proves itself with the secret; one
+    without proves itself with the PKCE verifier. The secret is never sent
+    empty: Spotify answers that with "invalid_client", which is what broke
+    the link when the deployment had no secret of its own.
+    """
+    data = {
+        "grant_type":    "authorization_code",
+        "code":          code,
+        "redirect_uri":  REDIRECT_URI,
+        "client_id":     CLIENT_ID,
+    }
+    if CLIENT_SECRET:
+        data["client_secret"] = CLIENT_SECRET
+    elif code_verifier:
+        data["code_verifier"] = code_verifier
     resp = requests.post(
         "https://accounts.spotify.com/api/token",
-        data={
-            "grant_type":    "authorization_code",
-            "code":          code,
-            "redirect_uri":  REDIRECT_URI,
-            "client_id":     CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-        },
+        data=data,
     )
     resp.raise_for_status()
     return resp.json()

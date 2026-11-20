@@ -196,6 +196,9 @@ def album_groups(spotify_id: str, user_id: str) -> list[dict]:
                 "album_spotify_id": album_id,
                 "title":            t["album_name"] or "Unknown Album",
                 "artist":           t["artist_names"] or "",
+                "artist_credits":   [
+                    name.strip() for name in (t["artist_names"] or "").split(",") if name.strip()
+                ],
                 "year":             t["release_year"] or 0,
                 "genre":            "",
                 "image_url":        t["album_image_url"] or "",
@@ -343,7 +346,7 @@ def filter_options(spotify_id: str, user_id: str) -> dict:
     groups = album_groups(spotify_id, user_id)
     artists: set[str] = set()
     for g in groups:
-        for name in (g["artist"] or "").split(","):
+        for name in g.get("artist_credits") or (g["artist"] or "").split(","):
             name = name.strip()
             if name:
                 artists.add(name)

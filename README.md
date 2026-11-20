@@ -13,7 +13,7 @@ Self-hosted server for the reSpotIt library, with a browser frontend and an opti
 ### Option A: Docker (recommended)
 ```bash
 # Run from the repo root: docker-compose.yml and .env live there.
-cp .env.example .env           # fill in SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET
+cp .env.example .env           # fill in SPOTIFY_CLIENT_ID (the client secret is optional)
 docker compose up -d --build   # api :8000, frontend :8888, db :5433
 ```
 

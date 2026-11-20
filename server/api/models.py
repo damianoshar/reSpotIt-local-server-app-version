@@ -152,6 +152,8 @@ class OAuthState(Base):
     __tablename__ = "oauth_states"
     state       = Column(Text, primary_key=True)
     user_id     = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    # PKCE verifier for a public-client deployment (no client secret).
+    code_verifier = Column(Text)
     created_at  = Column(TIMESTAMP(timezone=True), nullable=False, default=_utcnow)
 
 

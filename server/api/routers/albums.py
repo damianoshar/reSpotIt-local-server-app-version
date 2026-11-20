@@ -22,7 +22,7 @@ from ..services.export_log import record_export
 router = APIRouter(prefix="/api/v1/albums", tags=["albums"])
 
 
-def _apply_filters(q, db, search, album_type, min_pop, max_pop, genre, artist, year_from, year_to):
+def _apply_filters(q, db, search, album_type, min_pop, max_pop, genre, artists, year_from, year_to):
     """Apply all non-sort filters to a query and return it."""
     if search:
         q = q.filter(Album.name.ilike(f"%{search}%"))
@@ -34,8 +34,12 @@ def _apply_filters(q, db, search, album_type, min_pop, max_pop, genre, artist, y
         q = q.filter(Album.popularity <= max_pop)
     if genre:
         q = q.filter(func.array_to_string(Album.genres, ",").ilike(f"%{genre}%"))
-    if artist:
-        q = q.join(Album.artists).filter(Artist.name.ilike(f"%{artist}%"))
+    artist_names = [name.strip() for name in (artists or []) if name and name.strip()]
+    if artist_names:
+        # A selected artist set is an OR filter: match an album credited to
+        # any selected artist, including collaborator credits.
+        lowered_names = [name.lower() for name in artist_names]
+        q = q.filter(Album.artists.any(func.lower(Artist.name).in_(lowered_names)))
     if year_from:
         q = q.filter(Album.release_date >= date(year_from, 1, 1))
     if year_to:
@@ -72,7 +76,7 @@ def list_albums(    db:         Session = Depends(get_db),
     page:       int     = Query(1,  ge=1),
     limit:      int     = Query(48, ge=1, le=100000),
     search:     str     = Query(None),
-    artist:     str     = Query(None),
+    artist:     list[str] = Query(None),
     album_type: str     = Query(None),
     min_pop:    int     = Query(None, ge=0, le=100),
     max_pop:    int     = Query(None, ge=0, le=100),

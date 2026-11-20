@@ -149,13 +149,17 @@ export async function playContext(contextUri, getTokenOverride) {
   const url = id
     ? `https://api.spotify.com/v1/me/player/play?device_id=${encodeURIComponent(id)}`
     : 'https://api.spotify.com/v1/me/player/play'
+  // A track cannot be a `context_uri`; Spotify rejects it with a 400.
+  const body = contextUri.startsWith('spotify:track:')
+    ? { uris: [contextUri] }
+    : { context_uri: contextUri }
   const response = await fetch(url, {
     method: 'PUT',
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ context_uri: contextUri }),
+    body: JSON.stringify(body),
   })
   if (!response.ok) {
     const text = await response.text()

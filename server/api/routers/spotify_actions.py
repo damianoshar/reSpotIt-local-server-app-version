@@ -356,7 +356,7 @@ def playlist_albums(
     user:        User = Depends(get_current_user),
     search:    str = None,
     genre:     str = None,
-    artist:    str = None,
+    artist:    list[str] = None,
     year_from: str = None,
     year_to:   str = None,
     sort:      str = "artist",
@@ -388,14 +388,21 @@ def playlist_albums(
 
     q = (search or "").strip().lower()
     g = (genre or "").strip().lower()
-    a = (artist or "").strip().lower()
+    selected_artists = {name.strip().casefold() for name in (artist or []) if name and name.strip()}
 
     def keep(gr):
         if q and q not in gr["title"].lower() and q not in gr["artist"].lower():
             return False
         if g and gr["genre"].lower() != g:
             return False
-        if a and gr["artist"].lower() != a:
+        # Album groups store the comma-separated credits from the first
+        # playlist track. Match any selected credit, with OR semantics.
+        credits = {
+            name.strip().casefold()
+            for name in gr.get("artist_credits") or gr["artist"].split(",")
+            if name.strip()
+        }
+        if selected_artists and not selected_artists.intersection(credits):
             return False
         if year_from and not (gr["year"] and gr["year"] >= year_from):
             return False
@@ -640,7 +647,10 @@ def delete_playlist_now(playlist_id: str, user: User = Depends(get_current_user)
         unfollow_playlist(_token(user_id), playlist_id)
     except Exception as e:
         _handle(e)
-    retention_service.clear_retention(playlist_id, user_id)
+    try:
+        retention_service.clear_retention(playlist_id, user_id)
+    except Exception:
+        pass  # retention cleanup is best-effort after Spotify has confirmed
     try:
         delete_playlist_cache(playlist_id, user_id)
     except Exception:
@@ -659,10 +669,20 @@ def delete_playlist(
     try:
         token = _token(user_id)
         unfollow_playlist(token, playlist_id)
-        delete_playlist_cache(playlist_id, user_id)
-        return {"playlist_id": playlist_id, "deleted": True}
     except Exception as e:
         _handle(e)
+    # The playlist is gone: drop the cache and any retention rule that would
+    # otherwise keep looking for it. Same cleanup as delete-now, so a delete
+    # from the client leaves nothing behind. Cache upkeep never fails the call.
+    try:
+        retention_service.clear_retention(playlist_id, user_id)
+    except Exception:
+        pass  # retention cleanup is best-effort after Spotify has confirmed
+    try:
+        delete_playlist_cache(playlist_id, user_id)
+    except Exception:
+        pass
+    return {"playlist_id": playlist_id, "deleted": True}
 
 
 # --- Spotify account tools ---

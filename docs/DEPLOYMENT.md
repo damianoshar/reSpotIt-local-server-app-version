@@ -146,7 +146,7 @@ docker compose -f docker-compose.yml -f docker-compose.full.yml restart api
 
 | Group | Keys |
 |---|---|
-| Spotify | `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET`, `REDIRECT_URI`, `PUBLIC_BASE_URL` |
+| Spotify | `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET` (optional - without it the flow uses PKCE), `REDIRECT_URI`, `PUBLIC_BASE_URL` |
 | LAN origin | `LAN_IP`, `PUBLIC_ORIGIN` (auto-detected and rewritten on every start) |
 | Server | `SSL_ENABLED`, `CORS_ALLOW_ORIGIN`, `FORWARDED_ALLOW_IPS` |
 | Database | `DATABASE_URL` (default `postgresql://spotify:spotify@127.0.0.1:5433/spotify`) |

@@ -346,6 +346,23 @@ def list_tools(*, force: bool = False) -> list[dict[str, Any]]:
     return list(tools)
 
 
+def tool_servers() -> dict[str, str]:
+    """Map each public tool name to the alias of the server that owns it.
+
+    Display metadata for the tool registry (``tool_registry.build``), so a card
+    can say which server a tool belongs to without a second RPC round.
+    """
+    servers = _servers()
+    if not servers:
+        return {}
+    if _TOOLS_CACHE["key"] != _config_key(servers):
+        list_tools(force=True)
+    return {
+        name: route[0].alias
+        for name, route in _TOOLS_CACHE["routes"].items()
+    }
+
+
 def call_tool(name: str, arguments: dict[str, Any] | None = None) -> str:
     """Execute an MCP tool on the server that advertised it."""
     servers = _servers()

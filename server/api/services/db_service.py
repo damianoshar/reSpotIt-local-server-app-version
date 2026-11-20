@@ -182,7 +182,9 @@ def load_csv_to_db(
                     spotify_url  = EXCLUDED.spotify_url,
                     image_url    = EXCLUDED.image_url,
                     image_file   = EXCLUDED.image_file,
-                    added_at     = EXCLUDED.added_at
+                    -- A push/sync whose CSV has no date must not erase a date we
+                    -- already know: the phone can send an empty added_at column.
+                    added_at     = COALESCE(EXCLUDED.added_at, albums.added_at)
                 RETURNING id, (xmax = 0) AS was_inserted
                 """,
                 {

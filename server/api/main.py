@@ -131,6 +131,18 @@ async def lifespan(_: FastAPI):
             logger.warning("Orphaned concert-scan sweep failed: %s", e)
 
     await asyncio.to_thread(_fail_orphaned)
+
+    def _seed_mcp_grant() -> None:
+        """Hand the assistant's Spotify MCP the grant the app already holds."""
+        from .services import mcp_grant_service
+        try:
+            status = mcp_grant_service.seed()
+            logger.info("Assistant Spotify grant: %s", status.get("status"))
+        except Exception as e:  # never block startup
+            logger.warning("Assistant Spotify grant seed failed: %s", e)
+
+    await asyncio.to_thread(_seed_mcp_grant)
+
     task = asyncio.create_task(_retention_loop())
     import threading
     key_thread = threading.Thread(target=_auto_generate_owui_key_sync, daemon=True)

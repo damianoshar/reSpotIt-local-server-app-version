@@ -15,6 +15,11 @@ services:
   api:
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    volumes:
+      # The assistant's Spotify MCP reads this file; mcp_grant_service seeds it
+      # from the app's own Spotify grant (full-stack only — solo stacks have no
+      # Spotify MCP to feed).
+      - ./OpenWebUI-stack/spotify-mcp-data:/data/spotify-mcp
 
   # ────────────────────────────────────────────────────────────────────────────
   # OpenWebUI / Keycloak stack (from backup workspace)
@@ -114,8 +119,20 @@ services:
       ENABLE_API_KEYS: "true"
       USER_PERMISSIONS_FEATURES_API_KEYS: "true"
       BYPASS_MODEL_ACCESS_CONTROL: "true"
-      OPENAI_API_BASE_URLS: ${OPENAI_API_BASE_URL:-}
-      OPENAI_API_KEYS: ${OPENAI_API_KEY:-}
+      # Native context compaction. It counts messages+system only, not tool
+      # schemas, so the threshold leaves room for the router's ~3.3-4.6k of
+      # tools under LLM_CONTEXT_BUDGET (13,107).
+      ENABLE_CONTEXT_COMPACTION: "true"
+      CONTEXT_COMPACTION_TOKEN_THRESHOLD: "8000"
+      CONTEXT_COMPACTION_TOKEN_CAP: "8000"
+      CONTEXT_COMPACTION_RETENTION_PERCENTAGE: "40"
+      # First connection is llama-server; the second is the pipelines server,
+      # whose inlet filter guards every model. Both are seeded once - after
+      # that the DB config rows win, so a fresh stack needs this and an
+      # existing one keeps whatever the admin saved. The pipelines entry is
+      # appended only when PIPELINES_API_KEY is set.
+      OPENAI_API_BASE_URLS: ${OPENAI_API_BASE_URL:-}${PIPELINES_API_KEY:+;}${PIPELINES_API_KEY:+http://pipelines:9099}
+      OPENAI_API_KEYS: ${OPENAI_API_KEY:-}${PIPELINES_API_KEY:+;}${PIPELINES_API_KEY:-}
       SSL_CERT_FILE: /etc/ssl/ca-bundle.crt
       REQUESTS_CA_BUNDLE: /etc/ssl/ca-bundle.crt
       AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL: "False"
@@ -186,8 +203,20 @@ services:
       ENABLE_API_KEYS: "true"
       USER_PERMISSIONS_FEATURES_API_KEYS: "true"
       BYPASS_MODEL_ACCESS_CONTROL: "true"
-      OPENAI_API_BASE_URLS: ${OPENAI_API_BASE_URL:-}
-      OPENAI_API_KEYS: ${OPENAI_API_KEY:-}
+      # Native context compaction. It counts messages+system only, not tool
+      # schemas, so the threshold leaves room for the router's ~3.3-4.6k of
+      # tools under LLM_CONTEXT_BUDGET (13,107).
+      ENABLE_CONTEXT_COMPACTION: "true"
+      CONTEXT_COMPACTION_TOKEN_THRESHOLD: "8000"
+      CONTEXT_COMPACTION_TOKEN_CAP: "8000"
+      CONTEXT_COMPACTION_RETENTION_PERCENTAGE: "40"
+      # First connection is llama-server; the second is the pipelines server,
+      # whose inlet filter guards every model. Both are seeded once - after
+      # that the DB config rows win, so a fresh stack needs this and an
+      # existing one keeps whatever the admin saved. The pipelines entry is
+      # appended only when PIPELINES_API_KEY is set.
+      OPENAI_API_BASE_URLS: ${OPENAI_API_BASE_URL:-}${PIPELINES_API_KEY:+;}${PIPELINES_API_KEY:+http://pipelines:9099}
+      OPENAI_API_KEYS: ${OPENAI_API_KEY:-}${PIPELINES_API_KEY:+;}${PIPELINES_API_KEY:-}
       DATABASE_URL: ${DATABASE_URL:-postgresql://${OPENWEBUI_DB_USER:-openwebui}:${OPENWEBUI_DB_PASSWORD:-openwebui}@openwebui-db:5432/${OPENWEBUI_DB_NAME:-openwebui}}
     volumes:
       - ./docker-data/open-webui:/app/backend/data
@@ -227,8 +256,16 @@ services:
     restart: unless-stopped
     volumes:
       - ./docker-data/pipelines:/app/pipelines
+      # The guard is tracked in the repo and mounted over the (git-ignored)
+      # pipelines directory, so a fresh clone gets it too.
+      - ./pipelines/respotit_context_guard.py:/app/pipelines/respotit_context_guard.py:ro
     environment:
       PIPELINES_API_KEY: ${PIPELINES_API_KEY:-}
+      # Defaults for the inlet guard (docker-data/pipelines/
+      # respotit_context_guard/valves.json). Keys written into that file win;
+      # otherwise these apply. Keep them in step with the API's LLM_CONTEXT_*.
+      LLM_CONTEXT_TOKENS: ${LLM_CONTEXT_TOKENS:-16384}
+      LLM_CONTEXT_BUDGET: ${LLM_CONTEXT_BUDGET:-0.8}
 
   respotit-mcp:
     build:
@@ -247,16 +284,29 @@ services:
         condition: service_healthy
 
   spotify-mcp:
-    image: node:22-alpine
+    # The package is installed into the image (spotify-mcp/Dockerfile), so the
+    # container starts without downloading it from npm every time.
+    build:
+      context: ./spotify-mcp
+    image: respotit-spotify-mcp:3.1.1
     restart: unless-stopped
     ports:
       - "127.0.0.1:8090:8000"
+      # No OAuth callback port here on purpose. `spotify-mcp auth` opens a
+      # loopback listener (127.0.0.1:8899) that the browser must reach directly;
+      # a listener bound to the container's own loopback is not reachable
+      # through a published port, so the flow runs on the host instead
+      # (scripts/spotify-mcp-auth.ps1) and writes the token file through the
+      # bind mount below.
     volumes:
       - ./OpenWebUI-stack/spotify-mcp-data:/app/data
     working_dir: /app
-    command: ["npx", "-y", "@novalux12/spotify-mcp@3.1.1"]
+    command: ["spotify-mcp"]
     environment:
       SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
+      # PKCE callback used by scripts/spotify-mcp-auth.ps1 (which runs on the
+      # host). Keep in step with the redirect URI registered in the Spotify app.
+      SPOTIFY_REDIRECT_URI: ${SPOTIFY_MCP_REDIRECT_URI:-http://127.0.0.1:8899/callback}
       SPOTIFY_MCP_TRANSPORT: http
       SPOTIFY_MCP_HTTP_TOKEN: ${MCP_API_KEY:-change-me-mcp-token}
       SPOTIFY_MCP_HTTP_BIND: 0.0.0.0

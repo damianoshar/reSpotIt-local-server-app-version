@@ -25,7 +25,8 @@ GROUPS = [
     {
         "album_spotify_id": "a2",
         "title": "Rumours",
-        "artist": "Fleetwood Mac",
+        "artist": "Fleetwood Mac, Christine McVie",
+        "artist_credits": ["Fleetwood Mac", "Christine McVie"],
         "year": 1977,
         "genre": "Rock",
         "image_url": "",
@@ -36,7 +37,8 @@ GROUPS = [
     {
         "album_spotify_id": "a1",
         "title": "OK Computer",
-        "artist": "Radiohead",
+        "artist": "Radiohead, Mark Lanegan",
+        "artist_credits": ["Radiohead", "Mark Lanegan"],
         "year": 1997,
         "genre": "Rock",
         "image_url": "",
@@ -146,3 +148,9 @@ def test_each_album_carries_its_playlist_position(client, user):
 def test_the_default_sort_is_still_the_artist(client, user):
     r = _get(client, user)
     assert [i["id"] for i in r.json()["items"]] == ["a2", "a1"]
+
+
+def test_repeated_artist_filters_match_any_collaborator_credit(client, user):
+    r = _get(client, user, "?artist=Fleetwood+Mac&artist=Mark+Lanegan")
+    assert r.status_code == 200, r.text
+    assert {i["id"] for i in r.json()["items"]} == {"a1", "a2"}

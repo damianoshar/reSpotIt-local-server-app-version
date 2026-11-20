@@ -1,4 +1,6 @@
 """routers/auth.py — Spotify OAuth flow."""
+import logging
+
 from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
@@ -11,7 +13,9 @@ from ..services.auth_service import (
     build_auth_url, exchange_code, save_token, delete_token,
     get_valid_token, is_authenticated, validate_oauth_state,
 )
-from ..services import user_auth_service
+from ..services import mcp_grant_service, user_auth_service
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
 
@@ -97,18 +101,39 @@ def me(user: User = Depends(get_current_user)):
 def callback(code: str = None, error: str = None, state: str = None):
     if error or not code:
         return HTMLResponse(_ERROR_HTML.format(reason=error or "no code received"), status_code=400)
-    owner_id = validate_oauth_state(state)
-    if not owner_id:
+    grant = validate_oauth_state(state)
+    if not grant:
         return HTMLResponse(_ERROR_HTML.format(reason="invalid or expired state"), status_code=400)
     try:
-        save_token(exchange_code(code), owner_id)
-        return HTMLResponse(_SUCCESS_HTML)
+        save_token(exchange_code(code, grant.code_verifier), grant.user_id)
     except Exception as e:
         return HTMLResponse(_ERROR_HTML.format(reason=str(e)), status_code=500)
+    _sync_mcp_grant(grant.user_id)
+    return HTMLResponse(_SUCCESS_HTML)
+
+
+def _sync_mcp_grant(owner_id: str) -> None:
+    """Keep the assistant's MCP grant in step with a (re)link.
+
+    The MCP re-reads its token file per call, so no restart is needed. Only the
+    user the assistant already follows may move the file: the MCP runs on one
+    Spotify account, and seeding from someone else would switch accounts
+    silently. Never raises - a link must not fail because of the assistant.
+    """
+    try:
+        target = mcp_grant_service.target_user_id()
+        if target is None or target == owner_id:
+            mcp_grant_service.seed(force=True)
+    except Exception as e:
+        logger.warning("MCP grant seed after Spotify link failed: %s", e)
 
 
 def _unlink_spotify(user: User) -> dict:
     deleted = delete_token(str(user.id))
+    try:
+        mcp_grant_service.revoke(str(user.id))
+    except Exception as e:
+        logger.warning("MCP grant revoke after unlink failed: %s", e)
     return {"message": "Spotify unlinked." if deleted else "Spotify was not linked."}
 
 
@@ -152,7 +177,39 @@ def spotify_token_import(body: SpotifyTokenImport,
         "refresh_token": body.refresh_token,
         "expires_in":    body.expires_in,
     }, str(user.id))
+    _sync_mcp_grant(str(user.id))
     return {"connected": True}
+
+
+@router.get("/spotify/mcp-grant", summary="Assistant Spotify grant status")
+def mcp_grant_status(user: User = Depends(get_current_user)):
+    """Whether the Spotify MCP (the assistant's tools) has a usable grant."""
+    path = mcp_grant_service.token_file()
+    target = mcp_grant_service.target_user_id()
+    return {
+        "enabled": mcp_grant_service.enabled(),
+        "path": str(path),
+        "file_present": path.exists(),
+        "user_id": target,
+        "follows_caller": target == str(user.id),
+    }
+
+
+@router.post("/spotify/mcp-grant", summary="Seed the assistant's Spotify grant")
+def mcp_grant_seed(user: User = Depends(get_current_user)):
+    """Write the caller's grant into the MCP token file.
+
+    Only the user the assistant follows may do this: the MCP runs on a single
+    Spotify account, so seeding from another user would switch accounts.
+    """
+    target = mcp_grant_service.target_user_id()
+    if target != str(user.id):
+        raise HTTPException(
+            status_code=403,
+            detail="The assistant follows a different Spotify account; "
+                   "only that user can refresh its grant.",
+        )
+    return mcp_grant_service.seed(force=True, user_id=target)
 
 
 @router.delete("/spotify", summary="Unlink Spotify (client alias)")

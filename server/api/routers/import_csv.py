@@ -140,7 +140,9 @@ def import_csv(body: ImportBody, user: User = Depends(get_current_user)):
                             name         = EXCLUDED.name,
                             release_date = EXCLUDED.release_date,
                             image_url    = EXCLUDED.image_url,
-                            added_at     = EXCLUDED.added_at
+                            -- Keep a date we already have when the pushed CSV
+                            -- has none (mirror/merge pushes often omit it).
+                            added_at     = COALESCE(EXCLUDED.added_at, albums.added_at)
                         RETURNING id, (xmax = 0) AS was_inserted
                         """,
                         {

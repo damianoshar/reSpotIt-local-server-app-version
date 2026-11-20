@@ -257,14 +257,17 @@ class DeletePlaylistRouteTests(unittest.TestCase):
         self.token = patch.object(routes, "_token", return_value="token")
         self.unfollow = patch.object(routes, "unfollow_playlist")
         self.cache = patch.object(routes, "delete_playlist_cache")
+        self.clear_retention = patch.object(routes.retention_service, "clear_retention")
         self.auth.start()
         self.token.start()
         self.unfollow.start()
         self.cache.start()
+        self.clear_retention.start()
         self.addCleanup(self.auth.stop)
         self.addCleanup(self.token.stop)
         self.addCleanup(self.unfollow.stop)
         self.addCleanup(self.cache.stop)
+        self.addCleanup(self.clear_retention.stop)
 
     def test_success_unfollows_then_clears_cache(self):
         result = getattr(routes, "delete_playlist")("playlist", self.user)
@@ -272,6 +275,14 @@ class DeletePlaylistRouteTests(unittest.TestCase):
             result,
             {"playlist_id": "playlist", "deleted": True},
         )
+        routes.unfollow_playlist.assert_called_once_with("token", "playlist")
+        routes.retention_service.clear_retention.assert_called_once_with("playlist", "user-1")
+        routes.delete_playlist_cache.assert_called_once_with("playlist", "user-1")
+
+    def test_retention_cleanup_failure_does_not_fail_spotify_delete(self):
+        routes.retention_service.clear_retention.side_effect = RuntimeError("retention unavailable")
+        result = getattr(routes, "delete_playlist")("playlist", self.user)
+        self.assertEqual(result, {"playlist_id": "playlist", "deleted": True})
         routes.unfollow_playlist.assert_called_once_with("token", "playlist")
         routes.delete_playlist_cache.assert_called_once_with("playlist", "user-1")
 
